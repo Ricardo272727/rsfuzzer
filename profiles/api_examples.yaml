@@ -1,0 +1,90 @@
+# Example profile for api_examples (Node server on port 3000).
+# Use: rsfuzzer test --profile-file profiles/api_examples.yaml --roles user_alice,user_bob
+
+base_url: http://127.0.0.1:3000
+
+roles:
+  user_alice:
+    headers:
+      x-user-id: u1
+      x-role: user
+  user_bob:
+    headers:
+      x-user-id: u2
+      x-role: user
+  admin_root:
+    headers:
+      x-user-id: a1
+      x-role: admin
+
+# Substitutions for catalog paths (traffic + OpenAPI both use {id} for inferred IDs)
+fixtures:
+  path_params:
+    id: "101"
+  query_params:
+    expand: items
+
+# Explicit authorization checks (expected HTTP status per role)
+checks:
+  - id: bob_cannot_read_alice_order
+    method: GET
+    path: /api/orders/{id}
+    path_params:
+      id: "101"
+    expect:
+      user_alice: 200
+      user_bob: 403
+
+  - id: alice_cannot_read_bob_order
+    method: GET
+    path: /api/orders/{id}
+    path_params:
+      id: "102"
+    expect:
+      user_alice: 403
+      user_bob: 200
+
+  - id: admin_users_denied_for_normal_user
+    method: GET
+    path: /api/admin/users
+    expect:
+      user_alice: 403
+      admin_root: 200
+
+# Cartesian mutations: every (query_mutation x header_mutation x body_variant) must match expect.
+# The api_examples server includes intentional bugs (debug/expand/internal + spoofable x-trusted-subject).
+differential:
+  - id: get_order_mutation_surface
+    method: GET
+    path: /api/orders/{id}
+    path_params:
+      id: "101"
+    base_query: {}
+    query_mutations:
+      - {}
+      - { expand: internal }
+      - { debug: "1" }
+    header_mutations:
+      - {}
+      - { X-Trusted-Subject: u1 }
+    expect:
+      user_alice: 200
+      user_bob: 403
+
+  - id: patch_status_mutation_surface
+    method: PATCH
+    path: /api/orders/{id}/status
+    path_params:
+      id: "101"
+    base_query: {}
+    query_mutations:
+      - {}
+    header_mutations:
+      - {}
+      - { X-Trusted-Subject: u1 }
+    body:
+      status: shipped
+    body_mutations: []
+    expect:
+      user_alice: 200
+      user_bob: 403
