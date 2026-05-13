@@ -5,10 +5,17 @@ from typing import Any
 from rsfuzzer.mutations.strategies import AuthSessionStrategy
 from rsfuzzer.mutations.strategies import BoundaryStrategy
 from rsfuzzer.mutations.strategies import DeepJsonStrategy
+from rsfuzzer.mutations.strategies import DeserializationStrategy
+from rsfuzzer.mutations.strategies import HeaderSpoofingStrategy
 from rsfuzzer.mutations.strategies import HttpProtocolStrategy
+from rsfuzzer.mutations.strategies import IdBoundaryStrategy
 from rsfuzzer.mutations.strategies import InjectionStrategy
 from rsfuzzer.mutations.strategies import MultipartAbuseStrategy
+from rsfuzzer.mutations.strategies import ParameterPollutionStrategy
+from rsfuzzer.mutations.strategies import PathTraversalStrategy
+from rsfuzzer.mutations.strategies import PrivilegeEscalationStrategy
 from rsfuzzer.mutations.strategies import PrototypePollutionStrategy
+from rsfuzzer.mutations.strategies import RateLimitBypassStrategy
 from rsfuzzer.mutations.strategies import ResourceExhaustionStrategy
 from rsfuzzer.mutations.strategies import TypeConfusionStrategy
 from rsfuzzer.mutations.strategies import UnicodeEncodingStrategy
@@ -26,6 +33,13 @@ def default_strategies(*, light: bool = False) -> list[Any]:
         BoundaryStrategy(),
         UnicodeEncodingStrategy(),
         MultipartAbuseStrategy(),
+        PrivilegeEscalationStrategy(light=light),
+        IdBoundaryStrategy(light=light),
+        ParameterPollutionStrategy(light=light),
+        PathTraversalStrategy(light=light),
+        DeserializationStrategy(light=light),
+        RateLimitBypassStrategy(light=light),
+        HeaderSpoofingStrategy(light=light),
         AuthSessionStrategy(),
         HttpProtocolStrategy(),
     ]

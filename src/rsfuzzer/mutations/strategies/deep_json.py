@@ -47,10 +47,11 @@ class DeepJsonStrategy:
         yield wide, trace
 
         if body:
-            cyclic = copy.deepcopy(body)
-            cyclic["_self"] = cyclic
-            trace = MutationTrace(self.id, self.category, {"shape": "self_reference"})
-            yield cyclic, trace
+            layered = copy.deepcopy(body)
+            # JSON-serializable stand-in for a self-referential object (true cycles break json.dumps).
+            layered["_self"] = {"$ref": "#"}
+            trace = MutationTrace(self.id, self.category, {"shape": "self_ref_placeholder"})
+            yield layered, trace
 
     def mutate_query(
         self,

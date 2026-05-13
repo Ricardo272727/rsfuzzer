@@ -10,9 +10,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from rsfuzzer.mutations import MutationCase
+from rsfuzzer.mutations import permute_case
 from rsfuzzer.profiles import AuthzCheck
 from rsfuzzer.profiles import DifferentialCase
 from rsfuzzer.profiles import Profile
+
+
 @dataclass
 class HttpResult:
     status_code: int
@@ -29,6 +33,8 @@ class ScanRow:
     status_code: int
     body_preview: str
     skipped_reason: str | None = None
+    from_mutations: bool = False
+    mutation_traces: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -92,17 +98,27 @@ def expand_path(
     return out, None
 
 
-def build_query_string(endpoint_query_keys: list[str], fixtures: dict[str, Any]) -> str:
+def fixtures_query_dict(endpoint_query_keys: list[str], fixtures: dict[str, Any]) -> dict[str, str]:
     qp = fixtures.get("query_params")
     if not isinstance(qp, dict):
-        return ""
-    pairs: list[tuple[str, str]] = []
+        return {}
+    out: dict[str, str] = {}
     for key in endpoint_query_keys:
         if key in qp:
-            pairs.append((key, str(qp[key])))
+            out[str(key)] = str(qp[key])
+    return out
+
+
+def build_query_string(endpoint_query_keys: list[str], fixtures: dict[str, Any]) -> str:
+    pairs = list(fixtures_query_dict(endpoint_query_keys, fixtures).items())
     if not pairs:
         return ""
     return urlencode(pairs)
+
+
+def _client_error_preview(exc: BaseException, prefix: str) -> str:
+    msg = f"{prefix}{type(exc).__name__}: {exc}"
+    return msg.replace("\r", "\\r").replace("\n", "\\n")[:500]
 
 
 def http_request(
@@ -111,12 +127,24 @@ def http_request(
     headers: dict[str, str],
     body: dict[str, Any] | None,
 ) -> HttpResult:
-    data = None
-    hdrs = dict(headers)
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        hdrs.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method.upper())
+    """
+    Perform one HTTP request. Never raises for malformed URLs/headers/body or transport
+    failures: returns status_code 0 and a short ``body_preview`` reason so scans continue.
+    """
+    try:
+        data = None
+        hdrs = dict(headers)
+        if body is not None:
+            try:
+                raw_json = json.dumps(body, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                return HttpResult(0, body_preview=_client_error_preview(exc, "body_json:"))
+            data = raw_json.encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/json")
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method.upper())
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        return HttpResult(0, body_preview=_client_error_preview(exc, "request_build:"))
+
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read(4096)
@@ -128,6 +156,10 @@ def http_request(
         return HttpResult(status_code=exc.code, body_preview=text[:500])
     except urllib.error.URLError as exc:
         return HttpResult(status_code=0, body_preview=f"request_error: {exc.reason}")
+    except (ValueError, OSError) as exc:
+        return HttpResult(0, body_preview=_client_error_preview(exc, "request_send:"))
+    except Exception as exc:  # pragma: no cover - unexpected client/runtime errors
+        return HttpResult(0, body_preview=_client_error_preview(exc, "request_failed:"))
 
 
 def _differential_body_variants(case: DifferentialCase) -> list[dict[str, Any] | None]:
@@ -284,8 +316,17 @@ def run_catalog_scan(
     catalog: dict[str, Any],
     role_names: tuple[str, str],
     scope: str,
+    *,
+    mutate_max: int = 0,
+    mutate_light: bool = False,
+    mutate_parts: tuple[str, ...] = ("query", "headers"),
 ) -> tuple[list[ScanRow], set[tuple[str, str, str]]]:
-    """GET-only catalog scan for MVP. Returns rows and dedupe keys (method, url, role)."""
+    """GET-only catalog scan for MVP. Returns rows and dedupe keys (method, url, role).
+
+    If ``mutate_max`` > 0, after the baseline pass each catalog GET endpoint is exercised
+    per role with up to that many extra requests built via ``permute_case`` (same registry
+    as ``rsfuzzer mutate``).
+    """
     r_a, r_b = role_names
     if r_a not in profile.roles or r_b not in profile.roles:
         msg = f"Unknown role in --roles: {r_a!r} or {r_b!r}"
@@ -356,6 +397,74 @@ def run_catalog_scan(
                     body_preview=res.body_preview,
                 )
             )
+
+    if mutate_max <= 0:
+        return rows, seen
+
+    parts = mutate_parts if mutate_parts else ("query", "headers")
+    for ep in endpoints:
+        if not isinstance(ep, dict):
+            continue
+        method = str(ep.get("method", "")).upper()
+        path_t = str(ep.get("path", ""))
+        if not path_t or not path_matches_scope(path_t, scope):
+            continue
+        if method not in {"GET", "HEAD"}:
+            continue
+
+        param_names = ep.get("path_params") or []
+        if not isinstance(param_names, list):
+            param_names = []
+        str_names = [str(x) for x in param_names]
+
+        path_resolved, _skip_reason = expand_path(path_t, str_names, profile.fixtures)
+        if path_resolved is None:
+            continue
+
+        q_keys = ep.get("query_params") or []
+        if not isinstance(q_keys, list):
+            q_keys = []
+        str_qkeys = [str(x) for x in q_keys]
+        qd = fixtures_query_dict(str_qkeys, profile.fixtures)
+
+        for role_name in (r_a, r_b):
+            role_cfg = profile.roles[role_name]
+            case = MutationCase(
+                method=method,
+                path=path_resolved,
+                base_headers=dict(role_cfg.headers),
+                base_query=qd,
+                base_body=None,
+            )
+            for req in permute_case(
+                case,
+                light=mutate_light,
+                max_variants=mutate_max,
+                parts=parts,
+            ):
+                qs = urlencode(sorted(req.query.items())) if req.query else ""
+                m_url = f"{profile.base_url}{path_resolved}"
+                if qs:
+                    m_url = f"{m_url}?{qs}"
+                merged_headers = {**role_cfg.headers, **req.headers}
+                send_body: dict[str, Any] | None = None
+                if "body" in parts and method not in {"GET", "HEAD"}:
+                    send_body = req.body
+                res = http_request(method, m_url, merged_headers, send_body)
+                mutation_traces = [asdict(t) for t in req.traces]
+                rows.append(
+                    ScanRow(
+                        method=method,
+                        path_template=path_t,
+                        path_resolved=path_resolved,
+                        url=m_url,
+                        role=role_name,
+                        status_code=res.status_code,
+                        body_preview=res.body_preview,
+                        from_mutations=True,
+                        mutation_traces=mutation_traces,
+                    )
+                )
 
     return rows, seen
 

@@ -66,6 +66,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip GET catalog scan; only run explicit checks from profile.",
     )
+    test.add_argument(
+        "--max",
+        type=int,
+        default=0,
+        metavar="N",
+        help="With catalog scan: per GET endpoint and role, run up to N extra requests using the mutation engine (same as `mutate`). 0 disables.",
+    )
+    test.add_argument(
+        "--mutate-light",
+        action="store_true",
+        help="Smaller mutation set when --max > 0.",
+    )
+    test.add_argument(
+        "--mutate-parts",
+        default="query,headers",
+        help="With --max > 0: comma-separated axes body, query, headers.",
+    )
     test.set_defaults(func=run_test)
 
     mutate = subparsers.add_parser(
@@ -173,7 +190,18 @@ def run_test(args: argparse.Namespace) -> int:
     scan_rows: list = []
     if not args.no_scan:
         try:
-            scan_rows, _ = run_catalog_scan(profile, catalog, role_pair, args.scope)
+            mutate_parts = tuple(
+                p.strip() for p in args.mutate_parts.split(",") if p.strip()
+            ) or ("query", "headers")
+            scan_rows, _ = run_catalog_scan(
+                profile,
+                catalog,
+                role_pair,
+                args.scope,
+                mutate_max=args.max,
+                mutate_light=args.mutate_light,
+                mutate_parts=mutate_parts,
+            )
         except Exception as exc:
             print(f"[test] Catalog scan failed: {exc}")
             return 1
@@ -194,7 +222,8 @@ def run_test(args: argparse.Namespace) -> int:
     print(f"[test] Differential: {len(differential_results)} requests, {sum(1 for c in differential_results if not c.passed)} failed.")
     print(f"[test] Failed (checks + differential): {len(failed)}.")
     if not args.no_scan:
-        print(f"[test] Scan rows: {len(scan_rows)}")
+        n_mut = sum(1 for r in scan_rows if r.from_mutations)
+        print(f"[test] Scan rows: {len(scan_rows)} ({n_mut} mutation-engine).")
     print(f"[test] Report written to: {out_path}")
 
     return 1 if failed else 0

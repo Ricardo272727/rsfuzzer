@@ -29,6 +29,25 @@ def test_parser_has_expected_commands(tmp_path) -> None:
         ["test", "--profile-file", str(profile_file), "--roles", "a,b", "--no-scan"]
     )
     assert args.command == "test"
+    assert args.max == 0
+
+    args = parser.parse_args(
+        [
+            "test",
+            "--profile-file",
+            str(profile_file),
+            "--roles",
+            "a,b",
+            "--max",
+            "15",
+            "--mutate-light",
+            "--mutate-parts",
+            "headers",
+        ]
+    )
+    assert args.max == 15
+    assert args.mutate_light is True
+    assert args.mutate_parts == "headers"
 
     args = parser.parse_args(["report"])
     assert args.command == "report"
