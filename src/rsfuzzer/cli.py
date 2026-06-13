@@ -81,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument(
         "--mutate-parts",
         default="query,headers",
-        help="With --max > 0: comma-separated axes body, query, headers.",
+        help="With --max > 0: comma-separated axes body, query, headers. "
+        "Including body also scans POST/PATCH/PUT from the catalog with JSON payloads.",
     )
     test.set_defaults(func=run_test)
 
@@ -188,6 +189,7 @@ def run_test(args: argparse.Namespace) -> int:
         differential_results.extend(run_differential_case(profile, dcase))
 
     scan_rows: list = []
+    scan_failed = False
     if not args.no_scan:
         try:
             mutate_parts = tuple(
@@ -203,8 +205,8 @@ def run_test(args: argparse.Namespace) -> int:
                 mutate_parts=mutate_parts,
             )
         except Exception as exc:
-            print(f"[test] Catalog scan failed: {exc}")
-            return 1
+            scan_failed = True
+            print(f"[test] Catalog scan aborted early: {exc}")
 
     write_test_report(
         out_path,
@@ -223,7 +225,10 @@ def run_test(args: argparse.Namespace) -> int:
     print(f"[test] Failed (checks + differential): {len(failed)}.")
     if not args.no_scan:
         n_mut = sum(1 for r in scan_rows if r.from_mutations)
-        print(f"[test] Scan rows: {len(scan_rows)} ({n_mut} mutation-engine).")
+        n_err = sum(1 for r in scan_rows if r.status_code == 0 or r.client_error)
+        print(f"[test] Scan rows: {len(scan_rows)} ({n_mut} mutation-engine, {n_err} errors).")
+        if scan_failed:
+            print("[test] Warning: catalog scan did not finish; partial results in report.")
     print(f"[test] Report written to: {out_path}")
 
     return 1 if failed else 0

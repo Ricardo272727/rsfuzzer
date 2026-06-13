@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import fnmatch
+import http.client
 import json
+import math
 import urllib.error
 import urllib.request
 from dataclasses import asdict
@@ -21,6 +23,8 @@ from rsfuzzer.profiles import Profile
 class HttpResult:
     status_code: int
     body_preview: str
+    client_error: str | None = None
+    request_body_encoding: str | None = None
 
 
 @dataclass
@@ -35,6 +39,8 @@ class ScanRow:
     skipped_reason: str | None = None
     from_mutations: bool = False
     mutation_traces: list[dict[str, Any]] | None = None
+    client_error: str | None = None
+    request_body_encoding: str | None = None
 
 
 @dataclass
@@ -121,6 +127,54 @@ def _client_error_preview(exc: BaseException, prefix: str) -> str:
     return msg.replace("\r", "\\r").replace("\n", "\\n")[:500]
 
 
+def _encode_request_body(body: dict[str, Any]) -> tuple[bytes | None, str | None, str | None]:
+    """
+    Serialize JSON body for HTTP. Returns (payload bytes, client_error if unsent, encoding kind).
+    Non-RFC values (Infinity/NaN) are sent intentionally for parser fuzzing.
+    """
+    try:
+        raw = json.dumps(body, ensure_ascii=False, allow_nan=False)
+        return raw.encode("utf-8"), None, "strict"
+    except ValueError:
+        try:
+            raw = json.dumps(body, ensure_ascii=False, allow_nan=True)
+            return raw.encode("utf-8"), None, "non_rfc"
+        except (TypeError, ValueError) as exc:
+            return None, _client_error_preview(exc, "body_json:"), None
+    except TypeError as exc:
+        return None, _client_error_preview(exc, "body_json:"), None
+
+
+def _trace_to_dict(trace: Any) -> dict[str, Any]:
+    d = asdict(trace)
+    d["detail"] = _sanitize_for_json(d.get("detail", {}))
+    return d
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return str(value)
+    return value
+
+
+def _json_report_default(obj: Any) -> Any:
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return str(obj)
+    raise TypeError(type(obj).__name__)
+
+
+def _http_failure(exc: BaseException, prefix: str = "connection:") -> HttpResult:
+    return HttpResult(
+        status_code=0,
+        body_preview="",
+        client_error=_client_error_preview(exc, prefix),
+    )
+
+
 def http_request(
     method: str,
     url: str,
@@ -133,33 +187,63 @@ def http_request(
     """
     try:
         data = None
+        body_encoding: str | None = None
         hdrs = dict(headers)
         if body is not None:
-            try:
-                raw_json = json.dumps(body, ensure_ascii=False)
-            except (TypeError, ValueError) as exc:
-                return HttpResult(0, body_preview=_client_error_preview(exc, "body_json:"))
-            data = raw_json.encode("utf-8")
+            data, body_note, body_encoding = _encode_request_body(body)
+            if data is None:
+                return HttpResult(
+                    0,
+                    body_preview=body_note or "body_json:encode_failed",
+                    client_error=body_note,
+                )
             hdrs.setdefault("Content-Type", "application/json")
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method.upper())
     except (ValueError, TypeError, UnicodeEncodeError) as exc:
-        return HttpResult(0, body_preview=_client_error_preview(exc, "request_build:"))
+        err = _client_error_preview(exc, "request_build:")
+        return HttpResult(0, body_preview=err, client_error=err)
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read(4096)
             text = raw.decode("utf-8", errors="replace")
-            return HttpResult(status_code=resp.status, body_preview=text[:500])
+            return HttpResult(
+                status_code=resp.status,
+                body_preview=text[:500],
+                request_body_encoding=body_encoding,
+            )
     except urllib.error.HTTPError as exc:
         raw = exc.read(4096) if exc.fp else b""
         text = raw.decode("utf-8", errors="replace")
-        return HttpResult(status_code=exc.code, body_preview=text[:500])
+        return HttpResult(
+            status_code=exc.code,
+            body_preview=text[:500],
+            request_body_encoding=body_encoding,
+        )
     except urllib.error.URLError as exc:
-        return HttpResult(status_code=0, body_preview=f"request_error: {exc.reason}")
+        reason = exc.reason
+        if isinstance(reason, BaseException):
+            res = _http_failure(reason)
+        else:
+            res = HttpResult(0, body_preview="", client_error=f"connection:{reason}")
+        res.request_body_encoding = body_encoding
+        return res
+    except (http.client.RemoteDisconnected, http.client.IncompleteRead) as exc:
+        res = _http_failure(exc)
+        res.request_body_encoding = body_encoding
+        return res
+    except ConnectionError as exc:
+        res = _http_failure(exc)
+        res.request_body_encoding = body_encoding
+        return res
     except (ValueError, OSError) as exc:
-        return HttpResult(0, body_preview=_client_error_preview(exc, "request_send:"))
+        res = _http_failure(exc, "request_send:")
+        res.request_body_encoding = body_encoding
+        return res
     except Exception as exc:  # pragma: no cover - unexpected client/runtime errors
-        return HttpResult(0, body_preview=_client_error_preview(exc, "request_failed:"))
+        res = _http_failure(exc, "request_failed:")
+        res.request_body_encoding = body_encoding
+        return res
 
 
 def _differential_body_variants(case: DifferentialCase) -> list[dict[str, Any] | None]:
@@ -311,6 +395,119 @@ def _path_param_names_from_template(template: str) -> list[str]:
     return names
 
 
+_READ_METHODS = frozenset({"GET", "HEAD"})
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
+def _effective_mutate_parts(method: str, mutate_parts: tuple[str, ...]) -> tuple[str, ...]:
+    """GET/HEAD never send a JSON body; drop ``body`` so variants are not wasted."""
+    if method.upper() in _READ_METHODS:
+        return tuple(p for p in mutate_parts if p != "body")
+    return mutate_parts
+
+
+def _catalog_scan_methods(mutate_parts: tuple[str, ...]) -> frozenset[str]:
+    """Methods included in catalog baseline / mutation passes."""
+    methods = set(_READ_METHODS)
+    if "body" in mutate_parts:
+        methods |= _BODY_METHODS
+    return frozenset(methods)
+
+
+def fixture_body(profile: Profile, path_template: str, method: str) -> dict[str, Any]:
+    """JSON body seed for catalog POST/PATCH/PUT (profile ``fixtures.bodies`` or built-in default)."""
+    bodies = profile.fixtures.get("bodies")
+    if isinstance(bodies, dict):
+        raw = bodies.get(path_template)
+        if raw is None:
+            raw = bodies.get(f"{method.upper()} {path_template}")
+        if isinstance(raw, dict):
+            return {str(k): v for k, v in raw.items()}
+    defaults: dict[tuple[str, str], dict[str, Any]] = {
+        ("POST", "/api/orders"): {"total": 100},
+        ("PATCH", "/api/orders/{id}/status"): {"status": "shipped"},
+    }
+    return dict(defaults.get((method.upper(), path_template), {}))
+
+
+def _resolve_catalog_endpoint(
+    ep: dict[str, Any],
+    profile: Profile,
+    scope: str,
+    allowed_methods: frozenset[str],
+) -> tuple[str, str, str, list[str], list[str], dict[str, str], dict[str, Any] | None, str | None] | None:
+    """
+    Returns (method, path_template, path_resolved, path_param_names, query_keys, query_dict,
+    baseline_body, skip_reason). baseline_body is None for read methods.
+    """
+    method = str(ep.get("method", "")).upper()
+    path_t = str(ep.get("path", ""))
+    if not path_t or not path_matches_scope(path_t, scope):
+        return None
+    if method not in allowed_methods:
+        return None
+
+    param_names = ep.get("path_params") or []
+    if not isinstance(param_names, list):
+        param_names = []
+    str_names = [str(x) for x in param_names]
+
+    path_resolved, skip_reason = expand_path(path_t, str_names, profile.fixtures)
+    if path_resolved is None:
+        return method, path_t, "", str_names, [], {}, None, skip_reason
+
+    q_keys = ep.get("query_params") or []
+    if not isinstance(q_keys, list):
+        q_keys = []
+    str_qkeys = [str(x) for x in q_keys]
+    qd = fixtures_query_dict(str_qkeys, profile.fixtures)
+
+    baseline_body: dict[str, Any] | None = None
+    if method in _BODY_METHODS:
+        baseline_body = fixture_body(profile, path_t, method)
+
+    return method, path_t, path_resolved, str_names, str_qkeys, qd, baseline_body, None
+
+
+def _build_catalog_url(base_url: str, path_resolved: str, query: dict[str, str]) -> str:
+    url = f"{base_url}{path_resolved}"
+    if query:
+        url = f"{url}?{urlencode(sorted(query.items()))}"
+    return url
+
+
+def _scan_row_from_http(
+    *,
+    method: str,
+    path_template: str,
+    path_resolved: str,
+    url: str,
+    role: str,
+    res: HttpResult,
+    from_mutations: bool = False,
+    mutation_traces: list[dict[str, Any]] | None = None,
+    loop_error: str | None = None,
+) -> ScanRow:
+    preview = res.body_preview
+    if not preview and res.client_error:
+        preview = res.client_error
+    if loop_error:
+        preview = loop_error
+    return ScanRow(
+        method=method,
+        path_template=path_template,
+        path_resolved=path_resolved,
+        url=url,
+        role=role,
+        status_code=res.status_code,
+        body_preview=preview[:500],
+        from_mutations=from_mutations,
+        mutation_traces=mutation_traces,
+        client_error=loop_error or res.client_error,
+        request_body_encoding=res.request_body_encoding,
+    )
+
+
 def run_catalog_scan(
     profile: Profile,
     catalog: dict[str, Any],
@@ -321,11 +518,10 @@ def run_catalog_scan(
     mutate_light: bool = False,
     mutate_parts: tuple[str, ...] = ("query", "headers"),
 ) -> tuple[list[ScanRow], set[tuple[str, str, str]]]:
-    """GET-only catalog scan for MVP. Returns rows and dedupe keys (method, url, role).
+    """Catalog scan: read methods always; POST/PATCH/PUT when ``body`` is in ``mutate_parts``.
 
-    If ``mutate_max`` > 0, after the baseline pass each catalog GET endpoint is exercised
-    per role with up to that many extra requests built via ``permute_case`` (same registry
-    as ``rsfuzzer mutate``).
+    If ``mutate_max`` > 0, each eligible endpoint × role gets up to that many extra requests
+    via ``permute_case`` (same registry as ``rsfuzzer mutate``).
     """
     r_a, r_b = role_names
     if r_a not in profile.roles or r_b not in profile.roles:
@@ -338,25 +534,16 @@ def run_catalog_scan(
     if not isinstance(endpoints, list):
         return rows, seen
 
+    scan_methods = _catalog_scan_methods(mutate_parts if mutate_parts else ("query", "headers"))
+
     for ep in endpoints:
         if not isinstance(ep, dict):
             continue
-        method = str(ep.get("method", "")).upper()
-        path_t = str(ep.get("path", ""))
-        if not path_t:
+        resolved = _resolve_catalog_endpoint(ep, profile, scope, scan_methods)
+        if resolved is None:
             continue
-        if not path_matches_scope(path_t, scope):
-            continue
-        if method not in {"GET", "HEAD"}:
-            continue
-
-        param_names = ep.get("path_params") or []
-        if not isinstance(param_names, list):
-            param_names = []
-        str_names = [str(x) for x in param_names]
-
-        path_resolved, skip_reason = expand_path(path_t, str_names, profile.fixtures)
-        if path_resolved is None:
+        method, path_t, path_resolved, _str_names, str_qkeys, qd, baseline_body, skip_reason = resolved
+        if skip_reason is not None:
             rows.append(
                 ScanRow(
                     method=method,
@@ -371,13 +558,7 @@ def run_catalog_scan(
             )
             continue
 
-        q_keys = ep.get("query_params") or []
-        if not isinstance(q_keys, list):
-            q_keys = []
-        qs = build_query_string([str(x) for x in q_keys], profile.fixtures)
-        url = f"{profile.base_url}{path_resolved}"
-        if qs:
-            url = f"{url}?{qs}"
+        url = _build_catalog_url(profile.base_url, path_resolved, qd)
 
         for role_name in (r_a, r_b):
             key = (method, url, role_name)
@@ -385,16 +566,16 @@ def run_catalog_scan(
                 continue
             seen.add(key)
             role_cfg = profile.roles[role_name]
-            res = http_request(method, url, role_cfg.headers, None)
+            send_body = baseline_body if method in _BODY_METHODS else None
+            res = http_request(method, url, role_cfg.headers, send_body)
             rows.append(
-                ScanRow(
+                _scan_row_from_http(
                     method=method,
                     path_template=path_t,
                     path_resolved=path_resolved,
                     url=url,
                     role=role_name,
-                    status_code=res.status_code,
-                    body_preview=res.body_preview,
+                    res=res,
                 )
             )
 
@@ -405,27 +586,18 @@ def run_catalog_scan(
     for ep in endpoints:
         if not isinstance(ep, dict):
             continue
-        method = str(ep.get("method", "")).upper()
-        path_t = str(ep.get("path", ""))
-        if not path_t or not path_matches_scope(path_t, scope):
+        resolved = _resolve_catalog_endpoint(ep, profile, scope, scan_methods)
+        if resolved is None:
             continue
-        if method not in {"GET", "HEAD"}:
-            continue
-
-        param_names = ep.get("path_params") or []
-        if not isinstance(param_names, list):
-            param_names = []
-        str_names = [str(x) for x in param_names]
-
-        path_resolved, _skip_reason = expand_path(path_t, str_names, profile.fixtures)
-        if path_resolved is None:
+        method, path_t, path_resolved, _str_names, _str_qkeys, qd, baseline_body, skip_reason = resolved
+        if skip_reason is not None:
             continue
 
-        q_keys = ep.get("query_params") or []
-        if not isinstance(q_keys, list):
-            q_keys = []
-        str_qkeys = [str(x) for x in q_keys]
-        qd = fixtures_query_dict(str_qkeys, profile.fixtures)
+        eff_parts = _effective_mutate_parts(method, parts)
+        if not eff_parts:
+            continue
+
+        base_body = baseline_body if method in _BODY_METHODS else None
 
         for role_name in (r_a, r_b):
             role_cfg = profile.roles[role_name]
@@ -434,37 +606,48 @@ def run_catalog_scan(
                 path=path_resolved,
                 base_headers=dict(role_cfg.headers),
                 base_query=qd,
-                base_body=None,
+                base_body=base_body,
             )
             for req in permute_case(
                 case,
                 light=mutate_light,
                 max_variants=mutate_max,
-                parts=parts,
+                parts=eff_parts,
             ):
-                qs = urlencode(sorted(req.query.items())) if req.query else ""
-                m_url = f"{profile.base_url}{path_resolved}"
-                if qs:
-                    m_url = f"{m_url}?{qs}"
+                m_url = _build_catalog_url(profile.base_url, path_resolved, req.query)
                 merged_headers = {**role_cfg.headers, **req.headers}
                 send_body: dict[str, Any] | None = None
-                if "body" in parts and method not in {"GET", "HEAD"}:
+                if "body" in eff_parts and method in _BODY_METHODS:
                     send_body = req.body
-                res = http_request(method, m_url, merged_headers, send_body)
-                mutation_traces = [asdict(t) for t in req.traces]
-                rows.append(
-                    ScanRow(
-                        method=method,
-                        path_template=path_t,
-                        path_resolved=path_resolved,
-                        url=m_url,
-                        role=role_name,
-                        status_code=res.status_code,
-                        body_preview=res.body_preview,
-                        from_mutations=True,
-                        mutation_traces=mutation_traces,
+                try:
+                    res = http_request(method, m_url, merged_headers, send_body)
+                    mutation_traces = [_trace_to_dict(t) for t in req.traces]
+                    rows.append(
+                        _scan_row_from_http(
+                            method=method,
+                            path_template=path_t,
+                            path_resolved=path_resolved,
+                            url=m_url,
+                            role=role_name,
+                            res=res,
+                            from_mutations=True,
+                            mutation_traces=mutation_traces,
+                        )
                     )
-                )
+                except Exception as exc:
+                    rows.append(
+                        _scan_row_from_http(
+                            method=method,
+                            path_template=path_t,
+                            path_resolved=path_resolved,
+                            url=m_url,
+                            role=role_name,
+                            res=HttpResult(0, body_preview=""),
+                            from_mutations=True,
+                            mutation_traces=[_trace_to_dict(t) for t in req.traces],
+                            loop_error=_client_error_preview(exc, "scan_row:"),
+                        )
+                    )
 
     return rows, seen
 
@@ -482,6 +665,12 @@ def write_test_report(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     combined = check_results + differential_results
     failed_checks = [asdict(x) for x in combined if not x.passed]
+    scan_dicts = [asdict(x) for x in scan_rows]
+    scan_errors = [
+        row
+        for row in scan_dicts
+        if row.get("status_code") == 0 or row.get("client_error")
+    ]
     payload = {
         "profile": str(profile_path),
         "catalog": str(catalog_path),
@@ -491,9 +680,14 @@ def write_test_report(
         "differential": [asdict(x) for x in differential_results],
         "checks_all": [asdict(x) for x in combined],
         "check_failures": failed_checks,
-        "scan": [asdict(x) for x in scan_rows],
+        "scan": scan_dicts,
+        "scan_error_count": len(scan_errors),
+        "scan_errors": scan_errors,
     }
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    out_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True, default=_json_report_default),
+        encoding="utf-8",
+    )
 
 
 def role_pair_from_args(profile: Profile, roles_csv: str) -> tuple[str, str]:

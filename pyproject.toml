@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rsfuzzer"
 version = "0.1.0"
-description = "API logic and authorization fuzzer scaffold."
+description = "Strategy-driven fuzzing for API authorization and business-logic bugs."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [

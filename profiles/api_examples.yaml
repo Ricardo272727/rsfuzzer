@@ -23,6 +23,11 @@ fixtures:
     id: "101"
   query_params:
     expand: items
+  bodies:
+    "/api/orders":
+      total: 100
+    "/api/orders/{id}/status":
+      status: shipped
 
 # Explicit authorization checks (expected HTTP status per role)
 checks:
