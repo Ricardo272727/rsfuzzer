@@ -10,13 +10,17 @@ from rsfuzzer.mutations.strategies import HeaderSpoofingStrategy
 from rsfuzzer.mutations.strategies import HttpProtocolStrategy
 from rsfuzzer.mutations.strategies import IdBoundaryStrategy
 from rsfuzzer.mutations.strategies import InjectionStrategy
+from rsfuzzer.mutations.strategies import MassAssignmentStrategy
+from rsfuzzer.mutations.strategies import MethodOverrideStrategy
 from rsfuzzer.mutations.strategies import MultipartAbuseStrategy
+from rsfuzzer.mutations.strategies import OpenRedirectStrategy
 from rsfuzzer.mutations.strategies import ParameterPollutionStrategy
 from rsfuzzer.mutations.strategies import PathTraversalStrategy
 from rsfuzzer.mutations.strategies import PrivilegeEscalationStrategy
 from rsfuzzer.mutations.strategies import PrototypePollutionStrategy
 from rsfuzzer.mutations.strategies import RateLimitBypassStrategy
 from rsfuzzer.mutations.strategies import ResourceExhaustionStrategy
+from rsfuzzer.mutations.strategies import SsrfStrategy
 from rsfuzzer.mutations.strategies import TypeConfusionStrategy
 from rsfuzzer.mutations.strategies import UnicodeEncodingStrategy
 
@@ -35,8 +39,12 @@ def default_strategies(*, light: bool = False) -> list[Any]:
         MultipartAbuseStrategy(),
         PrivilegeEscalationStrategy(light=light),
         IdBoundaryStrategy(light=light),
+        MassAssignmentStrategy(light=light),
         ParameterPollutionStrategy(light=light),
         PathTraversalStrategy(light=light),
+        SsrfStrategy(light=light),
+        OpenRedirectStrategy(light=light),
+        MethodOverrideStrategy(light=light),
         DeserializationStrategy(light=light),
         RateLimitBypassStrategy(light=light),
         HeaderSpoofingStrategy(light=light),

